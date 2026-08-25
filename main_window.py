@@ -22,6 +22,7 @@ from event_types import (
     RecordedEvent, EV_MOUSE_CLICK, EV_MOUSE_MOVE, EV_MOUSE_SCROLL,
     EV_KEY_PRESS, EV_KEY_RELEASE,
 )
+from mini_window import MiniWindow
 from player import Player
 from recorder import Recorder
 from storage import Script, ScriptStorage
@@ -193,6 +194,14 @@ class MainWindow(QMainWindow):
         self._insert_mode = False
         self._insert_count = 0
 
+        # 悬浮小窗：录制/回放运行时自动缩小主窗口
+        self.mini = MiniWindow()
+        self.mini.pause_clicked.connect(self._toggle_pause)
+        self.mini.stop_clicked.connect(self._on_mini_stop)
+        self.mini.expand_clicked.connect(self._expand_from_mini)
+        self._mini_mode: str | None = None       # recording / playing / insert
+        self._last_progress: tuple[int, int] = (0, 0)
+
         self.recorder = Recorder(
             on_event=self._on_event_threadsafe,
             on_hotkey=self._on_hotkey_threadsafe,
@@ -217,6 +226,11 @@ class MainWindow(QMainWindow):
         self._flush_timer = QTimer(self)
         self._flush_timer.setInterval(200)
         self._flush_timer.timeout.connect(self._flush_pending_events)
+
+        # 悬浮小窗内容刷新定时器（状态/时长/事件数）
+        self._mini_timer = QTimer(self)
+        self._mini_timer.setInterval(200)
+        self._mini_timer.timeout.connect(self._update_mini)
 
     # ---------- UI 构建 ----------
 
@@ -654,6 +668,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(True)
         self._set_status("录制中… 按 F9 结束，F8 暂停", "recording")
         self._update_script_info()
+        self._enter_mini("recording")
 
     def _stop_recording(self):
         events = self.recorder.stop_recording()
@@ -674,6 +689,7 @@ class MainWindow(QMainWindow):
             "idle",
         )
         self._update_script_info()
+        self._exit_mini()
 
     # ---------- 回放控制 ----------
 
@@ -695,6 +711,7 @@ class MainWindow(QMainWindow):
         loops = self.loop_spin.value()
         ok = self.player.play(s.events, speed=speed, loops=loops)
         if ok:
+            self._last_progress = (0, len(s.events) * loops)
             self.btn_play.setText("■  停止回放  F10")
             self._set_btn_active(self.btn_play, True)
             self.btn_pause.setEnabled(True)
@@ -702,8 +719,10 @@ class MainWindow(QMainWindow):
                 f"回放中… {len(s.events)} 条 × {loops} 次 @ {speed}x（F8 暂停 / F10 停止）",
                 "playing",
             )
+            self._enter_mini("playing")
 
     def _on_progress_ui(self, done: int, total: int):
+        self._last_progress = (done, total)
         if self.player.paused:
             return  # 暂停时保持暂停提示，不被进度刷新覆盖
         self._set_status(f"回放中… {done}/{total}（F8 暂停 / F10 停止）", "playing")
@@ -712,6 +731,8 @@ class MainWindow(QMainWindow):
         if self._insert_mode:
             # 回放意外结束：丢弃未完成的插入录制（正常流程插入期间回放始终暂停）
             self._cancel_insert_recording()
+        self._last_progress = (0, 0)
+        self._exit_mini()
         self.btn_play.setText("▶  开始回放  F10")
         self._set_btn_active(self.btn_play, False)
         self._reset_pause_button()
@@ -725,6 +746,7 @@ class MainWindow(QMainWindow):
             self._stop_recording()
         if self.player.playing:
             self.player.stop()
+        self._exit_mini()
         self._reset_pause_button()
         self._set_status("已紧急停止", "idle")
 
@@ -793,6 +815,8 @@ class MainWindow(QMainWindow):
         self._pending_events.clear()
         self.recorder.start_recording()
         self._flush_timer.start()
+        self._mini_mode = "insert"
+        self._update_mini()
 
         self.btn_insert.setText("■  结束插入  F7")
         self._set_btn_active(self.btn_insert, True)
@@ -813,6 +837,9 @@ class MainWindow(QMainWindow):
         self._pending_events.clear()
         self._insert_mode = False
         self._restore_insert_ui()
+        # 回放仍保持暂停，小窗切回回放状态
+        self._mini_mode = "playing" if self.player.playing else None
+        self._update_mini()
 
         merged = self.player.insert_at_pause(events)
         s = self.current_script
@@ -853,6 +880,8 @@ class MainWindow(QMainWindow):
         self._pending_events.clear()
         self._insert_mode = False
         self._restore_insert_ui()
+        if self.player.playing:
+            self._mini_mode = "playing"
 
     def _restore_insert_ui(self):
         """恢复插入录制期间锁定的 UI 控件。"""
@@ -862,6 +891,87 @@ class MainWindow(QMainWindow):
         self.btn_play.setEnabled(True)
         self.btn_pause.setEnabled(True)
         self.script_list.setEnabled(True)
+
+    # ---------- 悬浮小窗 ----------
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """秒数格式化为 mm:ss。"""
+        s = max(0, int(seconds))
+        return f"{s // 60:02d}:{s % 60:02d}"
+
+    def _enter_mini(self, mode: str):
+        """隐藏主窗口，显示悬浮小窗。mode: recording / playing / insert。"""
+        self._mini_mode = mode
+        self.hide()
+        self._update_mini()
+        self.mini.show_at_default_position()
+        self._mini_timer.start()
+
+    def _exit_mini(self):
+        """隐藏悬浮小窗，恢复主窗口。"""
+        if self._mini_mode is None and not self.mini.isVisible():
+            return
+        self._mini_mode = None
+        self._mini_timer.stop()
+        self.mini.hide()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _expand_from_mini(self):
+        """小窗的 ▼/✕：恢复完整界面（当前录制/回放继续在后台运行）。"""
+        self._mini_mode = None
+        self._mini_timer.stop()
+        self.mini.hide()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._set_status("已展开完整界面 — 录制/回放仍在后台运行，热键有效", "idle")
+
+    def _on_mini_stop(self):
+        """小窗的停止按钮：停止当前的录制或回放。"""
+        if self._insert_mode:
+            # 先结束插入录制（拼接入时间线），再停止回放
+            self._finish_insert_recording()
+            if self.player.playing:
+                self.player.stop()
+            return
+        if self.recorder.recording:
+            self._toggle_record()
+        elif self.player.playing:
+            self.player.stop()
+
+    def _update_mini(self):
+        """根据当前模式刷新小窗内容。"""
+        if self._mini_mode is None:
+            return
+        if self._mini_mode == "recording":
+            paused = self.recorder.paused
+            self.mini.set_state("录制已暂停" if paused else "录制中",
+                                "#F59E0B" if paused else "#EF4444")
+            self.mini.set_time(self._fmt_duration(self.recorder._now()))
+            self.mini.set_count(f"事件数: {self._recorded_count + len(self._pending_events)}")
+            self.mini.set_speed("")
+            self.mini.set_pause_active(paused)
+        elif self._mini_mode == "insert":
+            self.mini.set_state("插入录制中", "#7C3AED")
+            self.mini.set_time(self._fmt_duration(self.recorder._now()))
+            self.mini.set_count(f"事件数: {self._insert_count + len(self._pending_events)}")
+            self.mini.set_speed("")
+            self.mini.set_pause_active(False)
+        elif self._mini_mode == "playing":
+            paused = self.player.paused
+            self.mini.set_state("回放已暂停" if paused else "回放中",
+                                "#F59E0B" if paused else "#3B82F6")
+            pos = self.player.position_time
+            dur = self.player.total_duration
+            self.mini.set_time(f"{pos:.1f}s / {dur:.1f}s")
+            done, total = self._last_progress
+            self.mini.set_count(f"事件数: {done}/{total}" if total else "事件数: 0")
+            speed = self.speed_combo.currentData()
+            self.mini.set_speed(f"回放速度: {speed:g}x")
+            self.mini.set_pause_active(paused)
 
     # ---------- 热键 ----------
 
@@ -915,4 +1025,5 @@ class MainWindow(QMainWindow):
         self.recorder.stop_recording()
         self.recorder.stop_listening()
         self.player.stop()
+        self.mini.close()
         event.accept()

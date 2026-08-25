@@ -87,6 +87,20 @@ class Player:
     def paused(self) -> bool:
         return self._playing and not self._pause_event.is_set()
 
+    @property
+    def position_time(self) -> float:
+        """当前已回放到的时间戳（最后一条已派发事件的 timestamp，秒）。"""
+        with self._lock:
+            return self._prev_t
+
+    @property
+    def total_duration(self) -> float:
+        """当前回放事件列表的总时长（最后一条事件的时间戳，秒）。"""
+        with self._lock:
+            if self._play_events:
+                return self._play_events[-1].timestamp
+            return 0.0
+
     # ---------- 控制 ----------
 
     def play(
