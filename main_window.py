@@ -28,7 +28,16 @@ from recorder import Recorder
 from storage import Script, ScriptStorage
 
 APP_TITLE = "鼠标键盘操作录制工具"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 数据存储目录：
+# - 源码运行：脚本所在目录（main_window.py 旁的 scripts/）
+# - PyInstaller 打包运行：__file__ 指向临时解压目录（_MEIxxxxx），
+#   exe 关闭后会被自动清理导致录制全部丢失——必须改用 exe 所在目录，
+#   这样 scripts/ 持久保存在 exe 旁边，跨多次启动不丢数据。
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 表格渲染上限：大量事件（如开启鼠标移动轨迹）时防止界面卡顿
 MAX_DISPLAY_ROWS = 5000
@@ -1022,7 +1031,29 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "提示", "录制/回放进行中，请先停止后再操作")
 
     def closeEvent(self, event):
-        self.recorder.stop_recording()
+        # 录制中途关闭窗口：把已录的事件保存下来，避免数据丢失
+        if self.recorder.recording:
+            events = self.recorder.stop_recording()
+            self._flush_timer.stop()
+            self._flush_pending_events()
+            if self.current_script is not None and events:
+                self.current_script.events = events
+                self.storage.save(self.current_script)
+        # 插入录制中途关闭：同样落盘（追加到脚本末尾）
+        elif self._insert_mode:
+            events = self.recorder.stop_recording()
+            self._flush_timer.stop()
+            self._pending_events.clear()
+            self._insert_mode = False
+            s = self.current_script
+            if s is not None and events:
+                base = s.events[-1].timestamp if s.events else 0.0
+                seg = [
+                    RecordedEvent(base + ev.timestamp, ev.event_type, dict(ev.data))
+                    for ev in events
+                ]
+                s.events = s.events + seg
+                self.storage.save(s)
         self.recorder.stop_listening()
         self.player.stop()
         self.mini.close()
