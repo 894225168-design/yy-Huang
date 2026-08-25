@@ -95,6 +95,7 @@ else:
 HOTKEY_TOGGLE_RECORD = "f9"       # 开始/停止录制
 HOTKEY_TOGGLE_PLAY = "f10"        # 开始/停止回放
 HOTKEY_TOGGLE_PAUSE = "f8"        # 暂停/继续（录制或回放）
+HOTKEY_INSERT_RECORD = "f7"       # 回放暂停期间：录制一段新操作插入到暂停位置
 HOTKEY_EMERGENCY_STOP = "f12"     # 紧急停止一切
 
 
@@ -122,6 +123,7 @@ class Recorder:
             "toggle_record": HOTKEY_TOGGLE_RECORD,
             "toggle_play": HOTKEY_TOGGLE_PLAY,
             "toggle_pause": HOTKEY_TOGGLE_PAUSE,
+            "insert_record": HOTKEY_INSERT_RECORD,
             "emergency_stop": HOTKEY_EMERGENCY_STOP,
         }
         # 反查表：key 名 -> 热键名

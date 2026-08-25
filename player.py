@@ -7,6 +7,8 @@
 - 修饰键时序保护：Shift/Ctrl/Alt 与鼠标事件（滚轮/点击）之间保证最小间隔，
   防止应用用 GetAsyncKeyState 读实时修饰键状态时读到错误值（Shift+滚轮偶发失效的根因）。
 - 回放期间把系统定时器分辨率提升到 1ms，改善短间隔事件的节奏准确性。
+- 插入动作：回放暂停期间可把一段新录制的事件拼接进回放时间线
+  （insert_at_pause），恢复回放后先执行插入的动作再继续原有动作。
 """
 
 import ctypes
@@ -59,6 +61,14 @@ class Player:
         self._playing = False
         self._lock = threading.Lock()
 
+        # 回放位置跟踪（供暂停期间的插入操作定位）：
+        # _play_events: 本次回放的事件列表（深拷贝，插入操作会原地修改）
+        # _next_index:  下一条待回放事件的索引（当前循环内）
+        # _prev_t:      最后一条已回放事件的时间戳
+        self._play_events: Optional[list[RecordedEvent]] = None
+        self._next_index = 0
+        self._prev_t = 0.0
+
         self._mouse_ctrl = mouse.Controller()
         self._kb_ctrl = keyboard.Controller()
 
@@ -104,9 +114,15 @@ class Player:
             self._last_modifier_press = 0.0
             self._last_mouse_dispatch = 0.0
             self._playing = True
+            # 深拷贝事件列表：插入操作会原地修改回放时间线，不能影响脚本对象
+            self._play_events = [
+                RecordedEvent(e.timestamp, e.event_type, dict(e.data)) for e in events
+            ]
+            self._next_index = 0
+            self._prev_t = 0.0
 
         self._thread = threading.Thread(
-            target=self._run, args=(list(events), speed, loops), daemon=True
+            target=self._run, args=(self._play_events, speed, loops), daemon=True
         )
         self._thread.start()
         return True
@@ -139,31 +155,70 @@ class Player:
         self.pause()
         return self.paused
 
+    def insert_at_pause(self, new_events: list[RecordedEvent]) -> Optional[list[RecordedEvent]]:
+        """回放暂停期间，把一段新录制的事件插入到暂停位置。
+
+        - 插入事件的时间戳 = 暂停点（最后已回放事件的时间戳）+ 录制相对时间
+        - 暂停点之后的原事件时间戳整体后移一个片段时长（彼此相对间隔不变）
+        - 恢复回放后先执行插入的动作，再继续原有动作；循环回放时后续轮次同样生效
+        - 返回合并后的完整事件列表（深拷贝，可直接赋给脚本持久化）；
+          回放未在暂停状态或事件为空时返回 None
+        """
+        with self._lock:
+            if not self._playing or self._pause_event.is_set():
+                return None
+            if self._play_events is None or not new_events:
+                return None
+            events = self._play_events
+            idx = self._next_index          # 下一条待回放事件：插入到它前面
+            base_t = self._prev_t           # 暂停点时间戳
+            seg_dur = new_events[-1].timestamp
+            inserted = [
+                RecordedEvent(base_t + max(ev.timestamp, 0.0), ev.event_type, dict(ev.data))
+                for ev in new_events
+            ]
+            # 暂停点之后的原事件整体后移，保持相对间隔
+            for j in range(idx, len(events)):
+                events[j].timestamp += seg_dur
+            events[idx:idx] = inserted
+            return [RecordedEvent(e.timestamp, e.event_type, dict(e.data)) for e in events]
+
     def _run(self, events: list[RecordedEvent], speed: float, loops: int) -> None:
         was_stopped = False
-        total = len(events) * loops
         done = 0
         self._set_timer_resolution(True)
         try:
             for loop_i in range(loops):
                 prev_t = 0.0
-                for ev in events:
-                    # 暂停时阻塞在此，直到继续（或停止）
+                idx = 0
+                with self._lock:
+                    self._next_index = 0
+                    self._prev_t = 0.0
+                # 显式索引循环（而非 for-each）：暂停期间可能有新事件插入当前位置
+                while idx < len(events):
                     self._pause_event.wait()
                     if self._stop_flag.is_set():
                         was_stopped = True
                         raise StopIteration
+                    ev = events[idx]
                     # 等待到该事件应发生的时刻
                     delay = (ev.timestamp - prev_t) / speed
-                    prev_t = ev.timestamp
                     if delay > 0 and not self._sleep(delay):
                         was_stopped = True
                         raise StopIteration
+                    if ev is not events[idx]:
+                        # 暂停期间当前位点被插入了新事件，重新评估
+                        continue
                     self._dispatch(ev)
+                    prev_t = ev.timestamp
+                    idx += 1
+                    with self._lock:
+                        self._next_index = idx
+                        self._prev_t = prev_t
                     done += 1
                     if self._on_progress:
                         try:
-                            self._on_progress(done, total)
+                            self._on_progress(done, len(events) * loops)
                         except Exception:
                             pass
                     if self._stop_flag.is_set():
@@ -175,6 +230,7 @@ class Player:
             self._set_timer_resolution(False)
             with self._lock:
                 self._playing = False
+                self._play_events = None
             if self._on_finished:
                 try:
                     self._on_finished(was_stopped)

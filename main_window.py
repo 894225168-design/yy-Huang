@@ -104,6 +104,17 @@ QPushButton#btnPause:disabled {
     color: #9CA3AF; background: #F9FAFB; border-color: #E5E7EB;
 }
 
+QPushButton#btnInsert {
+    background: #F5F3FF; border: 1px solid #DDD6FE; color: #7C3AED; font-weight: bold;
+}
+QPushButton#btnInsert:hover { background: #EDE9FE; }
+QPushButton#btnInsert[active="true"] {
+    background: #7C3AED; border-color: #7C3AED; color: #FFFFFF;
+}
+QPushButton#btnInsert:disabled {
+    color: #9CA3AF; background: #F9FAFB; border-color: #E5E7EB;
+}
+
 QPushButton#btnStop {
     background: #FFFFFF; border: 1px solid #D9DCE1; color: #4B5563; font-weight: bold;
 }
@@ -177,6 +188,10 @@ class MainWindow(QMainWindow):
         # 录制中的事件缓冲（批量刷新 UI，避免鼠标移动刷屏）
         self._pending_events: list[RecordedEvent] = []
         self._recorded_count = 0
+
+        # 插入录制模式：回放暂停期间录制一段新操作，插入到暂停位置
+        self._insert_mode = False
+        self._insert_count = 0
 
         self.recorder = Recorder(
             on_event=self._on_event_threadsafe,
@@ -347,6 +362,15 @@ class MainWindow(QMainWindow):
         self.btn_pause.setToolTip("暂停/继续当前的录制或回放")
         self.btn_pause.clicked.connect(self._toggle_pause)
         row1.addWidget(self.btn_pause, 1)
+
+        self.btn_insert = QPushButton("⏺  插入录制  F7")
+        self.btn_insert.setObjectName("btnInsert")
+        self.btn_insert.setMinimumHeight(40)
+        self.btn_insert.setToolTip(
+            "回放暂停期间：录制一段新操作，插入到暂停位置；恢复回放后先执行插入的动作"
+        )
+        self.btn_insert.clicked.connect(self._toggle_insert_record)
+        row1.addWidget(self.btn_insert, 1)
 
         self.btn_stop = QPushButton("■  紧急停止  F12")
         self.btn_stop.setObjectName("btnStop")
@@ -585,6 +609,11 @@ class MainWindow(QMainWindow):
             return
         rows = self._pending_events
         self._pending_events = []
+        if self._insert_mode:
+            # 插入录制：事件尚未确定插入位置，不追加到时间线表格，只更新计数
+            self._insert_count += len(rows)
+            self.count_label.setText(f"插入录制中：{self._insert_count} 条事件")
+            return
         self._append_table_rows(rows)
         self._recorded_count += len(rows)
         self.count_label.setText(f"{self._recorded_count} 条事件（录制中）")
@@ -592,6 +621,9 @@ class MainWindow(QMainWindow):
     # ---------- 录制控制 ----------
 
     def _toggle_record(self):
+        if self._insert_mode:
+            self._set_status("插入录制中 — 按 F7 结束插入", "recording")
+            return
         if self.player.playing:
             self._set_status("回放进行中，无法录制", "playing")
             return
@@ -646,6 +678,9 @@ class MainWindow(QMainWindow):
     # ---------- 回放控制 ----------
 
     def _toggle_play(self):
+        if self._insert_mode:
+            self._set_status("插入录制中 — 按 F7 结束插入", "recording")
+            return
         if self.recorder.recording:
             self._set_status("录制进行中，无法回放", "recording")
             return
@@ -674,12 +709,18 @@ class MainWindow(QMainWindow):
         self._set_status(f"回放中… {done}/{total}（F8 暂停 / F10 停止）", "playing")
 
     def _on_finished_ui(self, stopped: bool):
+        if self._insert_mode:
+            # 回放意外结束：丢弃未完成的插入录制（正常流程插入期间回放始终暂停）
+            self._cancel_insert_recording()
         self.btn_play.setText("▶  开始回放  F10")
         self._set_btn_active(self.btn_play, False)
         self._reset_pause_button()
         self._set_status("回放已停止" if stopped else "回放完成", "idle")
 
     def _emergency_stop(self):
+        if self._insert_mode:
+            # 紧急停止 = 放弃一切：未完成的插入录制直接丢弃
+            self._cancel_insert_recording()
         if self.recorder.recording:
             self._stop_recording()
         if self.player.playing:
@@ -691,6 +732,9 @@ class MainWindow(QMainWindow):
 
     def _toggle_pause(self):
         """F8：暂停/继续当前的录制或回放。"""
+        if self._insert_mode:
+            self._set_status("插入录制中 — 按 F7 结束插入后再继续回放", "recording")
+            return
         if self.recorder.recording:
             if self.recorder.paused:
                 self.recorder.resume_recording()
@@ -714,7 +758,7 @@ class MainWindow(QMainWindow):
                 self.player.pause()
                 self.btn_pause.setText("▶  继续  F8")
                 self._set_btn_active(self.btn_pause, True)
-                self._set_status("回放已暂停 — 按 F8 继续，F10 停止", "paused")
+                self._set_status("回放已暂停 — F8 继续 / F7 插入录制 / F10 停止", "paused")
         else:
             self._set_status("当前没有进行中的录制或回放", "idle")
 
@@ -723,6 +767,101 @@ class MainWindow(QMainWindow):
         self.btn_pause.setText("⏸  暂停  F8")
         self._set_btn_active(self.btn_pause, False)
         self.btn_pause.setEnabled(False)
+
+    # ---------- 插入录制（回放暂停期间） ----------
+
+    def _toggle_insert_record(self):
+        """F7：回放暂停期间，录制一段新操作插入到暂停位置。"""
+        if self._insert_mode:
+            self._finish_insert_recording()
+            return
+        if self.recorder.recording:
+            self._set_status("正在录制中，无法插入录制（先按 F9 结束）", "recording")
+            return
+        if not self.player.playing:
+            self._set_status("插入录制需先开始回放并按 F8 暂停", "idle")
+            return
+        if not self.player.paused:
+            self._set_status("请先按 F8 暂停回放，再按 F7 插入录制", "playing")
+            return
+        self._start_insert_recording()
+
+    def _start_insert_recording(self):
+        """开始在回放暂停位置录制插入动作（回放保持暂停不终止）。"""
+        self._insert_mode = True
+        self._insert_count = 0
+        self._pending_events.clear()
+        self.recorder.start_recording()
+        self._flush_timer.start()
+
+        self.btn_insert.setText("■  结束插入  F7")
+        self._set_btn_active(self.btn_insert, True)
+        # 插入录制期间锁定其余操作，保证插入位置语义明确
+        self.btn_record.setEnabled(False)
+        self.btn_play.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+        self.script_list.setEnabled(False)
+        self.count_label.setText("插入录制中：0 条事件")
+        self._set_status("插入录制中… 动作将插入到回放暂停位置，按 F7 结束", "recording")
+
+    def _finish_insert_recording(self):
+        """结束插入录制：把录制的事件拼接进回放时间线并持久化到脚本。"""
+        if not self._insert_mode:
+            return
+        events = self.recorder.stop_recording()
+        self._flush_timer.stop()
+        self._pending_events.clear()
+        self._insert_mode = False
+        self._restore_insert_ui()
+
+        merged = self.player.insert_at_pause(events)
+        s = self.current_script
+        if merged is None:
+            # 回放已不在暂停状态：插入的事件退回为追加到脚本末尾，避免丢失
+            if s is not None and events:
+                base = s.events[-1].timestamp if s.events else 0.0
+                seg = [
+                    RecordedEvent(base + ev.timestamp, ev.event_type, dict(ev.data))
+                    for ev in events
+                ]
+                s.events = s.events + seg
+                self.storage.save(s)
+                self._refresh_script_list(select=s)
+                self._render_timeline(s.events)
+                self._set_status("回放已结束，插入录制的事件已追加到脚本末尾", "idle")
+            else:
+                self._set_status("插入录制已取消" if not events else "未找到当前脚本，插入的事件已丢弃", "idle")
+            return
+
+        if s is None:
+            self._set_status("未找到当前脚本，插入的事件已丢弃", "idle")
+            return
+        s.events = merged
+        self.storage.save(s)
+        self._refresh_script_list(select=s)
+        self._render_timeline(merged)
+        self._set_status(
+            f"已插入 {len(events)} 条事件到回放暂停位置 — 按 F8 继续回放", "paused",
+        )
+
+    def _cancel_insert_recording(self):
+        """放弃插入录制（紧急停止 / 回放意外结束时调用）。"""
+        if not self._insert_mode:
+            return
+        self.recorder.stop_recording()
+        self._flush_timer.stop()
+        self._pending_events.clear()
+        self._insert_mode = False
+        self._restore_insert_ui()
+
+    def _restore_insert_ui(self):
+        """恢复插入录制期间锁定的 UI 控件。"""
+        self.btn_insert.setText("⏺  插入录制  F7")
+        self._set_btn_active(self.btn_insert, False)
+        self.btn_record.setEnabled(True)
+        self.btn_play.setEnabled(True)
+        self.btn_pause.setEnabled(True)
+        self.script_list.setEnabled(True)
 
     # ---------- 热键 ----------
 
@@ -733,6 +872,8 @@ class MainWindow(QMainWindow):
             self._toggle_play()
         elif name == "toggle_pause":
             self._toggle_pause()
+        elif name == "insert_record":
+            self._toggle_insert_record()
         elif name == "emergency_stop":
             self._emergency_stop()
 
