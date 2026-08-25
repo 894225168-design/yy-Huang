@@ -4,14 +4,13 @@
 - 无边框、置顶、可拖拽（按住空白处拖动），默认停靠屏幕底部中央。
 - 显示：状态圆点+文字+已用时长、暂停/停止按钮、事件数、回放速度、展开/关闭按钮。
 - 仅通过信号与主窗口交互（pause/stop/expand），不直接操作录制与回放逻辑。
-- 圆角外观通过外层透明背景 + 内层圆角面板实现，附投影。
+- 圆角外观通过外层透明背景 + 内层圆角面板实现（不使用投影效果：
+  分层窗口下越界绘制会触发 UpdateLayeredWindowIndirect 参数错误警告）。
 """
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QLabel, QPushButton, QFrame, QApplication,
-    QGraphicsDropShadowEffect,
 )
 
 MINI_STYLE = """
@@ -19,7 +18,7 @@ QWidget { font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
 
 QFrame#miniPanel {
     background: #FFFFFF;
-    border: 1px solid #E5E7EB;
+    border: 1px solid #D1D5DB;
     border-radius: 22px;
 }
 
@@ -124,12 +123,10 @@ class MiniWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(panel)
 
-        # 投影
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(18)
-        shadow.setOffset(0, 3)
-        shadow.setColor(QColor(0, 0, 0, 45))
-        panel.setGraphicsEffect(shadow)
+        # 注意：不使用 QGraphicsDropShadowEffect —— 阴影会在组件边界外绘制，
+        # 分层窗口（WA_TranslucentBackground）更新时 Qt 会把越界的 dirty rect
+        # 传给 UpdateLayeredWindowIndirect，控制台刷"参数错误"警告。
+        # 用面板边框替代阴影作为视觉边界。
 
         self._drag_pos = None
 
