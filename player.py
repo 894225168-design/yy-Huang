@@ -77,6 +77,11 @@ class Player:
         self._last_modifier_press = 0.0        # 最近一次修饰键按下时刻
         self._last_mouse_dispatch = 0.0        # 最近一次鼠标事件（滚轮/点击）分发时刻
 
+        # 光标位置跟踪：避免重复设置相同坐标时多余的 settle 等待
+        self._last_cursor_pos: Optional[tuple] = None
+        # 当前回放速度倍率（供修饰键保护时间按速度缩放）
+        self._speed = 1.0
+
     # ---------- 状态 ----------
 
     @property
@@ -127,6 +132,8 @@ class Player:
             self._held_modifiers.clear()
             self._last_modifier_press = 0.0
             self._last_mouse_dispatch = 0.0
+            self._last_cursor_pos = None
+            self._speed = speed
             self._playing = True
             # 深拷贝事件列表：插入操作会原地修改回放时间线，不能影响脚本对象
             self._play_events = [
@@ -205,6 +212,11 @@ class Player:
             for loop_i in range(loops):
                 prev_t = 0.0
                 idx = 0
+                # 上一条事件 dispatch 完成时刻：用于计算下一条事件的绝对触发时刻。
+                # 不用相对延迟（delay = 间隔/speed），因为 dispatch 本身有开销
+                # （settle/guard/pynput 调用），相对延迟会让开销逐条累积，
+                # 高倍速下后续事件节奏被压缩，滚轮消息被 Windows 吞掉。
+                prev_dispatch_end = time.monotonic()
                 with self._lock:
                     self._next_index = 0
                     self._prev_t = 0.0
@@ -215,8 +227,10 @@ class Player:
                         was_stopped = True
                         raise StopIteration
                     ev = events[idx]
-                    # 等待到该事件应发生的时刻
-                    delay = (ev.timestamp - prev_t) / speed
+                    # 绝对触发时刻 = 上一条 dispatch 完成时刻 + 理论间隔
+                    # dispatch 开销被自然纳入间隔，不会累积
+                    target = prev_dispatch_end + (ev.timestamp - prev_t) / speed
+                    delay = target - time.monotonic()
                     if delay > 0 and not self._sleep(delay):
                         was_stopped = True
                         raise StopIteration
@@ -224,6 +238,7 @@ class Player:
                         # 暂停期间当前位点被插入了新事件，重新评估
                         continue
                     self._dispatch(ev)
+                    prev_dispatch_end = time.monotonic()
                     prev_t = ev.timestamp
                     idx += 1
                     with self._lock:
@@ -289,12 +304,17 @@ class Player:
         et, d = ev.event_type, ev.data
         try:
             if et == EV_MOUSE_MOVE:
-                self._mouse_ctrl.position = (d["x"], d["y"])
+                pos = (d["x"], d["y"])
+                self._mouse_ctrl.position = pos
+                self._last_cursor_pos = pos
             elif et == EV_MOUSE_CLICK:
                 self._ensure_modifiers(d.get("mods"))
                 self._guard_before_mouse()
-                self._mouse_ctrl.position = (d["x"], d["y"])
-                time.sleep(_MOUSE_SETTLE)
+                pos = (d["x"], d["y"])
+                if self._last_cursor_pos != pos:
+                    self._mouse_ctrl.position = pos
+                    time.sleep(_MOUSE_SETTLE)
+                    self._last_cursor_pos = pos
                 # Button 枚举按名称查找（Button["left"]），不是按值（Button("left")会报错）
                 btn_name = d.get("button", "left")
                 btn = mouse.Button[btn_name]
@@ -306,8 +326,13 @@ class Player:
             elif et == EV_MOUSE_SCROLL:
                 self._ensure_modifiers(d.get("mods"))
                 self._guard_before_mouse()
-                self._mouse_ctrl.position = (d["x"], d["y"])
-                time.sleep(_MOUSE_SETTLE)
+                pos = (d["x"], d["y"])
+                if self._last_cursor_pos != pos:
+                    self._mouse_ctrl.position = pos
+                    time.sleep(_MOUSE_SETTLE)
+                    self._last_cursor_pos = pos
+                # 光标没变时跳过 settle：连续滚轮通常在同一位置，
+                # 高倍速下 10ms 的固定延时会打乱事件节奏导致消息被吞
                 self._mouse_ctrl.scroll(d.get("dx", 0), d.get("dy", 0))
                 self._last_mouse_dispatch = time.monotonic()
             elif et == EV_KEY_PRESS:
@@ -349,24 +374,28 @@ class Player:
 
         如果修饰键刚按下不久，补足最小间隔，确保应用在处理鼠标消息前
         已经能感知到修饰键处于按下状态。
+        高倍速回放时按速度缩放保护时间，避免固定 30ms 打乱事件节奏。
         """
         if not self._held_modifiers:
             return
+        guard = _MODIFIER_GUARD / max(self._speed, 1.0)
         elapsed = time.monotonic() - self._last_modifier_press
-        if elapsed < _MODIFIER_GUARD:
-            time.sleep(_MODIFIER_GUARD - elapsed)
+        if elapsed < guard:
+            time.sleep(guard - elapsed)
 
     def _guard_before_modifier_release(self) -> None:
         """修饰键释放前的保护。
 
         如果刚分发过鼠标事件，补足最小间隔，确保应用处理该鼠标消息时
         修饰键仍处于按下状态（修复 Shift+滚轮偶发变纵向滚动的问题）。
+        高倍速回放时按速度缩放保护时间。
         """
         if not self._held_modifiers or self._last_mouse_dispatch == 0.0:
             return
+        guard = _MODIFIER_GUARD / max(self._speed, 1.0)
         elapsed = time.monotonic() - self._last_mouse_dispatch
-        if elapsed < _MODIFIER_GUARD:
-            time.sleep(_MODIFIER_GUARD - elapsed)
+        if elapsed < guard:
+            time.sleep(guard - elapsed)
 
     def _resolve_key(self, d: dict):
         """从事件数据重建按键对象。优先用 vk（虚拟键码，不受修饰键影响）。"""
