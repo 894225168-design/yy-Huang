@@ -6,7 +6,8 @@
   键盘按 键名+按下/释放 合并）
 - 顶部时间刻度尺：刻度间隔随缩放自适应（0.1s ~ 300s）
 - 事件卡片固定尺寸，按泳道（lane）错层排布避免重叠
-- 缩放控件：- / + / 适配窗口；底部迷你地图显示密度与视口位置，点击跳转
+- 缩放控件：- / + / 适配窗口；底部滑块显示密度与视口位置，
+  拖拽滑块 / 点击轨道 / 滚轮（Shift+滚轮）控制视口左右移动
 - 回放位置标记：蓝色竖线 + 时间标签，由外部 position_provider 驱动刷新
 """
 
@@ -170,6 +171,14 @@ class _TimelineCanvas(QWidget):
         super().__init__()
         self.view = view
 
+    def wheelEvent(self, e):
+        # 横向时间轴没有纵向滚动：滚轮（含 Shift+滚轮）直接控制左右移动。
+        # 部分系统在 Shift 下把滚轮报到 x 分量，两个都兼容。
+        delta = e.angleDelta()
+        steps = -(delta.y() or delta.x()) / 120
+        self.view.nudge_scroll(steps)
+        e.accept()
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -185,54 +194,121 @@ class _TimelineCanvas(QWidget):
         v.paint_marker(p)
 
 
-class _MiniMap(QWidget):
-    """底部迷你地图：事件密度 + 视口位置，点击跳转。"""
+class _SliderBar(QWidget):
+    """底部滑块：事件密度轨道 + 可拖拽滑块，控制画布横向滚动。
+
+    - 滑块宽度 ∝ 视口/内容宽度，位置对应当前滚动位置
+    - 拖拽滑块：视口跟随左右移动；点击轨道：视口跳到点击处（按住可继续拖）
+    - 滚轮 / Shift+滚轮：按视口比例步进滚动
+    """
+
+    THUMB_MIN_W = 28.0
 
     def __init__(self, view: "SimpleTimelineWidget"):
         super().__init__()
         self.view = view
-        self.setFixedHeight(20)
+        self.setFixedHeight(24)
         self.setCursor(Qt.PointingHandCursor)
+        self._drag_offset: float | None = None  # 拖拽中：抓取点相对滑块左缘的偏移
+
+    # ---------- 几何换算 ----------
+
+    def _thumb_rect(self) -> QRectF:
+        """滑块当前矩形（轨道坐标系）。"""
+        v = self.view
+        w = self.width()
+        cw = v.canvas.width()
+        vw = v.scroll.viewport().width()
+        if cw <= 0 or vw >= cw:
+            # 内容未超出视口：滑块占满轨道（不可滚动）
+            return QRectF(1, 3, max(w - 2, 1), self.height() - 6)
+        track = w - 2
+        thumb_w = max(self.THUMB_MIN_W, vw / cw * track)
+        sb = v.scroll.horizontalScrollBar()
+        frac = sb.value() / max(1, sb.maximum())
+        x = 1 + frac * (track - thumb_w)
+        return QRectF(x, 3, thumb_w, self.height() - 6)
+
+    def _set_viewport_frac(self, frac: float):
+        """把视口左缘设置到轨道比例 frac（0~1）处。"""
+        sb = self.view.scroll.horizontalScrollBar()
+        sb.setValue(int(max(0.0, min(1.0, frac)) * sb.maximum()))
+
+    def _frac_for_thumb_left(self, x: float) -> float:
+        """滑块左缘 x → 轨道比例。"""
+        track = self.width() - 2
+        thumb_w = self._thumb_rect().width()
+        if track <= thumb_w:
+            return 0.0
+        return (x - 1) / (track - thumb_w)
+
+    # ---------- 绘制 ----------
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        p.fillRect(self.rect(), QColor("#F4F5F7"))
+        # 轨道背景
         p.setPen(QPen(QColor("#E5E7EB"), 1))
-        p.drawLine(0, 0, w, 0)
+        p.setBrush(QColor("#F4F5F7"))
+        p.drawRoundedRect(QRectF(0.5, 2.5, w - 1, h - 3.5), 6, 6)
+        # 事件密度刻度
         v = self.view
         dur = v.duration
         if dur > 0:
             p.setPen(QPen(QColor("#93C5FD"), 2))
             for g in v.groups:
-                x = int(g.start_time / dur * (w - 2)) + 1
-                p.drawLine(x, 5, x, h - 5)
-        # 视口指示框
-        sb = v.scroll.horizontalScrollBar()
-        cw = v.canvas.width()
-        if cw > 0:
-            vw = v.scroll.viewport().width()
-            vx = sb.value() / cw * w
-            vw2 = min(vw / cw * w, w)
-            p.setPen(QPen(QColor("#2563EB"), 1.2))
-            p.setBrush(QColor(37, 99, 235, 30))
-            p.drawRoundedRect(QRectF(vx, 1.5, vw2, h - 3), 4, 4)
+                x = int(g.start_time / dur * (w - 4)) + 2
+                p.drawLine(x, 6, x, h - 6)
+        # 滑块
+        thumb = self._thumb_rect()
+        p.setPen(QPen(QColor("#2563EB"), 1.2))
+        p.setBrush(QColor(37, 99, 235, 46))
+        p.drawRoundedRect(thumb, 6, 6)
+        # 握把纹（三条竖线，提示可拖拽）
+        if thumb.width() >= 24:
+            cx = thumb.center().x()
+            cy = thumb.center().y()
+            p.setPen(QPen(QColor("#2563EB"), 1.4))
+            for dx in (-5, 0, 5):
+                p.drawLine(int(cx + dx), int(cy - 4), int(cx + dx), int(cy + 4))
+
+    # ---------- 交互 ----------
 
     def mousePressEvent(self, e):
-        v = self.view
-        sb = v.scroll.horizontalScrollBar()
-        vw = v.scroll.viewport().width()
-        # 点击位置对齐到视口中心
-        frac = e.x() / max(self.width(), 1)
-        target = int(frac * v.canvas.width() - vw / 2)
-        sb.setValue(max(0, min(target, sb.maximum())))
+        thumb = self._thumb_rect()
+        if thumb.contains(e.localPos()):
+            # 抓住滑块：记录抓取偏移，拖拽时视口跟随
+            self._drag_offset = e.localPos().x() - thumb.x()
+        else:
+            # 点击轨道：视口中心跳到点击处，并进入拖拽状态（按住即可继续拖）
+            self._drag_offset = thumb.width() / 2
+            self._set_viewport_frac(
+                self._frac_for_thumb_left(e.localPos().x() - self._drag_offset)
+            )
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_offset is None:
+            return
+        self._set_viewport_frac(
+            self._frac_for_thumb_left(e.localPos().x() - self._drag_offset)
+        )
+
+    def mouseReleaseEvent(self, e):
+        self._drag_offset = None
+
+    def wheelEvent(self, e):
+        delta = e.angleDelta()
+        steps = -(delta.y() or delta.x()) / 120
+        self.view.nudge_scroll(steps)
+        e.accept()
 
 
 # ---------- 主视图 ----------
 
 class SimpleTimelineWidget(QWidget):
-    """简略版横向时间线（自包含：头部统计 + 缩放控件 + 滚动画布 + 迷你地图）。"""
+    """简略版横向时间线（自包含：头部统计 + 缩放控件 + 滚动画布 + 底部滑块）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -298,10 +374,10 @@ class SimpleTimelineWidget(QWidget):
         self.scroll.setWidget(self.canvas)
         root.addWidget(self.scroll, 1)
 
-        # 迷你地图
-        self.minimap = _MiniMap(self)
-        root.addWidget(self.minimap)
-        self.scroll.horizontalScrollBar().valueChanged.connect(self.minimap.update)
+        # 底部滑块（拖拽/滚轮控制视口滚动）
+        self.slider = _SliderBar(self)
+        root.addWidget(self.slider)
+        self.scroll.horizontalScrollBar().valueChanged.connect(self.slider.update)
 
         # 位置标记刷新（回放中由 position_provider 驱动）
         self._marker_timer = QTimer(self)
@@ -369,7 +445,18 @@ class SimpleTimelineWidget(QWidget):
             f"总事件: {total} 条（合并为 {len(self.groups)} 组）    总时长: {_fmt_duration(self.duration)}"
         )
         self.canvas.update()
-        self.minimap.update()
+        self.slider.update()
+
+    # ---------- 滚动 ----------
+
+    def nudge_scroll(self, steps: float):
+        """按视口宽度比例横向滚动。steps 为滚轮格数（正=向右）。"""
+        sb = self.scroll.horizontalScrollBar()
+        if sb.maximum() <= 0:
+            return
+        vw = self.scroll.viewport().width()
+        delta = int(steps * vw * 0.15)  # 每格滚 15% 视口宽度
+        sb.setValue(max(0, min(sb.value() + delta, sb.maximum())))
 
     # ---------- 缩放 ----------
 
