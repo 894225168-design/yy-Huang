@@ -26,6 +26,7 @@ from mini_window import MiniWindow
 from player import Player
 from recorder import Recorder
 from storage import Script, ScriptStorage
+from timeline_view import SimpleTimelineWidget
 
 APP_TITLE = "鼠标键盘操作录制工具"
 
@@ -211,6 +212,10 @@ class MainWindow(QMainWindow):
         self._mini_mode: str | None = None       # recording / playing / insert
         self._last_progress: tuple[int, int] = (0, 0)
 
+        # 事件时间线视图模式：detail（详细表格）/ simple（简略横向时间轴）
+        self._view_mode = "detail"
+        self._current_events: list[RecordedEvent] = []
+
         self.recorder = Recorder(
             on_event=self._on_event_threadsafe,
             on_hotkey=self._on_hotkey_threadsafe,
@@ -316,9 +321,30 @@ class MainWindow(QMainWindow):
         lay.setSpacing(8)
 
         header = QHBoxLayout()
-        title = QLabel("事件时间线")
-        title.setObjectName("sectionTitle")
-        header.addWidget(title)
+        self.timeline_title = QLabel("事件时间线")
+        self.timeline_title.setObjectName("sectionTitle")
+        header.addWidget(self.timeline_title)
+        header.addSpacing(10)
+
+        # 详细/简略 视图切换（分段控件样式）
+        seg_style = (
+            "QPushButton { border: 1px solid #D9DCE1; background: #FFFFFF; color: #6B7280;"
+            " min-height: 24px; max-height: 24px; padding: 0 12px; font-size: 12px; }"
+            "QPushButton:checked { background: #EFF6FF; color: #1D4ED8; border-color: #BFDBFE;"
+            " font-weight: bold; }"
+        )
+        self.btn_view_detail = QPushButton("详细")
+        self.btn_view_detail.setCheckable(True)
+        self.btn_view_detail.setChecked(True)
+        self.btn_view_detail.setStyleSheet(seg_style + "QPushButton { border-radius: 6px 0 0 6px; }")
+        self.btn_view_detail.clicked.connect(lambda: self._set_view_mode("detail"))
+        header.addWidget(self.btn_view_detail)
+        self.btn_view_simple = QPushButton("简略")
+        self.btn_view_simple.setCheckable(True)
+        self.btn_view_simple.setStyleSheet(seg_style + "QPushButton { border-radius: 0 6px 6px 0; border-left: none; }")
+        self.btn_view_simple.clicked.connect(lambda: self._set_view_mode("simple"))
+        header.addWidget(self.btn_view_simple)
+
         header.addStretch(1)
         self.count_label = QLabel("0 条事件")
         self.count_label.setObjectName("subLabel")
@@ -330,10 +356,38 @@ class MainWindow(QMainWindow):
         self.hint_page.setObjectName("hintLabel")
         self.hint_page.setAlignment(Qt.AlignCenter)
         self.event_table = self._build_event_table()
-        self.timeline_stack.addWidget(self.hint_page)
-        self.timeline_stack.addWidget(self.event_table)
+        self.simple_view = SimpleTimelineWidget()
+        self.simple_view.position_provider = self._playback_position
+        self.timeline_stack.addWidget(self.hint_page)      # 0
+        self.timeline_stack.addWidget(self.event_table)    # 1
+        self.timeline_stack.addWidget(self.simple_view)    # 2
         lay.addWidget(self.timeline_stack, 1)
         return panel
+
+    def _playback_position(self):
+        """供简略视图轮询回放位置标记；未在回放时返回 None 隐藏标记。"""
+        if self.player.playing:
+            return self.player.position_time
+        return None
+
+    def _set_view_mode(self, mode: str):
+        """切换事件时间线的 详细/简略 视图。"""
+        if mode == self._view_mode:
+            return
+        self._view_mode = mode
+        self.btn_view_detail.setChecked(mode == "detail")
+        self.btn_view_simple.setChecked(mode == "simple")
+        self.timeline_title.setText(
+            "事件时间线（横向视图）" if mode == "simple" else "事件时间线"
+        )
+        if mode == "simple":
+            self.simple_view.set_events(self._current_events)
+            self.timeline_stack.setCurrentWidget(self.simple_view)
+        else:
+            if self._current_events:
+                self.timeline_stack.setCurrentWidget(self.event_table)
+            else:
+                self.timeline_stack.setCurrentWidget(self.hint_page)
 
     def _build_event_table(self) -> QTableWidget:
         table = QTableWidget(0, 4)
@@ -582,6 +636,13 @@ class MainWindow(QMainWindow):
     # ---------- 时间线渲染 ----------
 
     def _render_timeline(self, events: list[RecordedEvent]):
+        self._current_events = events
+        if self._view_mode == "simple":
+            self.simple_view.set_events(events)
+            self.timeline_stack.setCurrentWidget(self.simple_view)
+            total = len(events)
+            self.count_label.setText(f"{total} 条事件")
+            return
         self.event_table.setRowCount(0)
         if not events:
             self.timeline_stack.setCurrentWidget(self.hint_page)
@@ -596,7 +657,7 @@ class MainWindow(QMainWindow):
 
     def _append_table_rows(self, events: list[RecordedEvent]):
         table = self.event_table
-        if self.timeline_stack.currentWidget() is not table:
+        if self._view_mode == "detail" and self.timeline_stack.currentWidget() is not table:
             self.timeline_stack.setCurrentWidget(table)
         start = table.rowCount()
         if start >= MAX_DISPLAY_ROWS:
@@ -637,8 +698,12 @@ class MainWindow(QMainWindow):
             self._insert_count += len(rows)
             self.count_label.setText(f"插入录制中：{self._insert_count} 条事件")
             return
-        self._append_table_rows(rows)
         self._recorded_count += len(rows)
+        if self._view_mode == "simple":
+            # 简略视图：增量合并追加（不重排已有分组）
+            self.simple_view.append_events(rows)
+        else:
+            self._append_table_rows(rows)
         self.count_label.setText(f"{self._recorded_count} 条事件（录制中）")
 
     # ---------- 录制控制 ----------
@@ -666,7 +731,11 @@ class MainWindow(QMainWindow):
         self.event_table.setRowCount(0)
         self._pending_events.clear()
         self._recorded_count = 0
-        self.timeline_stack.setCurrentWidget(self.event_table)
+        self._current_events = []
+        self.simple_view.clear()
+        self.timeline_stack.setCurrentWidget(
+            self.simple_view if self._view_mode == "simple" else self.event_table
+        )
         self.count_label.setText("0 条事件（录制中）")
 
         self.recorder.start_recording()
