@@ -49,6 +49,7 @@ RULER_H = 48                # 刻度尺高度
 CARD_W = 132                # 卡片固定宽度
 CARD_H = 62                 # 卡片固定高度
 LANE_GAP = 10               # 泳道间距
+MAX_LANES = 3               # 泳道上限：卡片最多三行，放不下时右移排队而非纵向堆叠
 LEFT_PAD = 16
 RIGHT_PAD = 80
 CARD_X_GAP = 8              # 同泳道相邻卡片最小水平间距
@@ -82,7 +83,7 @@ def _sign(v) -> int:
 class EventGroup:
     """一组连续同类型事件的合并结果。"""
 
-    __slots__ = ("event_type", "signature", "events", "start_time", "end_time", "lane")
+    __slots__ = ("event_type", "signature", "events", "start_time", "end_time", "lane", "card_x")
 
     def __init__(self, ev: RecordedEvent):
         self.event_type = ev.event_type
@@ -91,6 +92,7 @@ class EventGroup:
         self.start_time = ev.timestamp
         self.end_time = ev.timestamp
         self.lane = 0
+        self.card_x = 0.0  # 卡片实际 x（泳道占满时可能右移，与时间点 x 不同）
 
     @staticmethod
     def _signature_of(ev: RecordedEvent):
@@ -202,12 +204,12 @@ class _SliderBar(QWidget):
     - 滚轮 / Shift+滚轮：按视口比例步进滚动
     """
 
-    THUMB_MIN_W = 28.0
+    THUMB_MIN_W = 56.0   # 滑块最小宽度：长内容下也要容易抓取
 
     def __init__(self, view: "SimpleTimelineWidget"):
         super().__init__()
         self.view = view
-        self.setFixedHeight(24)
+        self.setFixedHeight(32)
         self.setCursor(Qt.PointingHandCursor)
         self._drag_offset: float | None = None  # 拖拽中：抓取点相对滑块左缘的偏移
 
@@ -420,22 +422,37 @@ class SimpleTimelineWidget(QWidget):
             # 缩放变化时所有卡片 x 都变，泳道必须全量重排
             self._lane_ends = []
             from_index = 0
-        # 泳道分配：增量时只处理新增分组（已有分组的 x 不变，泳道分配保持有效）
+        # 泳道分配：增量时只处理新增分组（已有分组的位置不变，分配保持有效）。
+        # 最多 MAX_LANES 行：三条泳道都占满时，卡片右移到最早空出的位置，
+        # 避免在一个窗口内纵向拥挤（连接线会斜指向真实时间点，时间不丢精度）。
         for g in self.groups[from_index:]:
             x = LEFT_PAD + g.start_time * self.px_per_sec
-            placed = False
+            lane = -1
+            # 已有泳道中的第一个空位
             for i, end_x in enumerate(self._lane_ends):
                 if x >= end_x + CARD_X_GAP:
-                    g.lane = i
-                    self._lane_ends[i] = x + CARD_W
-                    placed = True
+                    lane = i
                     break
-            if not placed:
-                g.lane = len(self._lane_ends)
-                self._lane_ends.append(x + CARD_W)
+            if lane >= 0:
+                card_x = x
+            elif len(self._lane_ends) < MAX_LANES:
+                # 泳道数未满：开新泳道
+                lane = len(self._lane_ends)
+                self._lane_ends.append(0.0)
+                card_x = x
+            else:
+                # 三条泳道都占满：右移到最早空出的泳道位置
+                lane = min(range(MAX_LANES), key=lambda i: self._lane_ends[i])
+                card_x = self._lane_ends[lane] + CARD_X_GAP
+            g.lane = lane
+            g.card_x = card_x
+            self._lane_ends[lane] = card_x + CARD_W
 
-        lanes = max(1, len(self._lane_ends))
-        content_w = LEFT_PAD + self.duration * self.px_per_sec + RIGHT_PAD
+        lanes = max(1, min(len(self._lane_ends), MAX_LANES))
+        # 内容宽度：右移排队的卡片可能超出时间轴自然宽度，取两者较大值
+        time_w = LEFT_PAD + self.duration * self.px_per_sec + RIGHT_PAD
+        cards_w = (max(self._lane_ends) if self._lane_ends else 0) + RIGHT_PAD
+        content_w = max(time_w, cards_w)
         vp_w = self.scroll.viewport().width()
         w = max(int(content_w), vp_w)
         h = RULER_H + lanes * (CARD_H + LANE_GAP) + 12
@@ -538,15 +555,16 @@ class SimpleTimelineWidget(QWidget):
     def paint_groups(self, p: QPainter):
         base_y = RULER_H - 10
         for g in self.groups:
-            x = LEFT_PAD + g.start_time * self.px_per_sec
+            time_x = LEFT_PAD + g.start_time * self.px_per_sec  # 真实时间点
+            x = g.card_x                                        # 卡片实际位置（可能右移）
             y = RULER_H + g.lane * (CARD_H + LANE_GAP)
             color = QColor(GROUP_COLORS.get(g.event_type, "#1F2329"))
-            # 连接线：刻度尺上的圆点 + 到卡片的竖线
+            # 连接线：刻度尺上的圆点标记真实时间，斜线连到（可能右移的）卡片
             p.setPen(QPen(QColor("#D1D5DB"), 1))
-            p.drawLine(int(x), base_y, int(x), int(y))
+            p.drawLine(int(time_x), base_y, int(x + 3), int(y))
             p.setBrush(color)
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QRectF(x - 3, base_y - 3, 6, 6))
+            p.drawEllipse(QRectF(time_x - 3, base_y - 3, 6, 6))
             # 卡片
             card = QRectF(x, y, CARD_W, CARD_H)
             p.setPen(QPen(QColor("#E5E7EB"), 1))
